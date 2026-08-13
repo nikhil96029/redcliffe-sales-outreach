@@ -522,7 +522,7 @@ const PITCH_ANGLES = [
 
 const AVATAR_COLORS = ["#6366f1","#0ea5e9","#10b981","#f59e0b","#ec4899"];
 
-const STEPS = ["Scan Events","People","Insights","Email"];
+const STEPS = ["Scan Events","People","Insights"];
 
 /* ── OpenAI key (per-browser, never sent to anyone but our own server) ── */
 const OPENAI_KEY_STORAGE = "redcliffe_openai_key";
@@ -541,46 +541,45 @@ function parseJSON(text) {
   return JSON.parse(clean);
 }
 
-async function callAI(userPrompt) {
-  const res = await fetch("/api/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      max_tokens: 1000,
-      messages: [
-        { role: "system", content: "Return only valid JSON. No markdown, no extra text." },
-        { role: "user",   content: userPrompt },
-      ],
-      openai_key: getOpenAIKey(),
-    }),
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error?.message || `HTTP ${res.status}`);
-  }
-  const data = await res.json();
-  return parseJSON(data.choices[0].message.content);
-}
-
 function getInitials(name) {
   return name.split(" ").map(w => w[0]).slice(0,2).join("").toUpperCase();
 }
 
-function downloadCSV(people, eventName) {
-  const headers = ["Name", "Position", "Company", "Topic / Session", "Email Hint"];
-  const rows = people.map(p => [p.name, p.title, p.company, p.topic || "", p.email_hint || ""]);
-  const escape = v => `"${(v || "").replace(/"/g, '""')}"`;
+function downloadRows(headers, rows, filename) {
+  const escape = v => `"${(v || "").toString().replace(/"/g, '""')}"`;
   const csv = [headers, ...rows].map(r => r.map(escape).join(",")).join("\r\n");
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `${eventName.replace(/[^a-z0-9]/gi, "_").toLowerCase()}_speakers.csv`;
+  a.download = filename;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+function downloadCSV(people, eventName) {
+  const headers = ["Name", "Position", "Company", "Topic / Session", "Email Hint"];
+  const rows = people.map(p => [p.name, p.title, p.company, p.topic || "", p.email_hint || ""]);
+  downloadRows(headers, rows, `${eventName.replace(/[^a-z0-9]/gi, "_").toLowerCase()}_speakers.csv`);
+}
+
+function downloadInsightsCSV(people, insights, eventName) {
+  const insightMap = Object.fromEntries(insights.map(ins => [ins.id, ins]));
+  const headers = [
+    "Name", "Position", "Company", "Topic / Session", "Email Hint",
+    "Event Status", "Speaking Topic", "What They Said", "Pain Points", "Hook", "Opportunity",
+  ];
+  const rows = people.map(p => {
+    const ins = insightMap[p.id] || {};
+    return [
+      p.name, p.title, p.company, p.topic || "", p.email_hint || "",
+      ins.event_status || "", ins.speaking_topic || "", ins.what_they_said || "",
+      (ins.pain_points || []).join(" | "), ins.hook || "", ins.opportunity || "",
+    ];
+  });
+  downloadRows(headers, rows, `${eventName.replace(/[^a-z0-9]/gi, "_").toLowerCase()}_insights.csv`);
 }
 
 /* ── Shared Components ─────────────────────────────────────── */
@@ -976,7 +975,7 @@ const STATUS_CONFIG = {
   upcoming: { label: "Upcoming event",   color: "#f59e0b", bg: "rgba(245,158,11,.1)"  },
 };
 
-function Step3({ event, people, onNext, onBack }) {
+function Step3({ event, people, onBack }) {
   const [insights,    setInsights]    = React.useState([]);
   const [sourceLinks, setSourceLinks] = React.useState([]);
   const [loading,     setLoading]     = React.useState(false);
@@ -1117,8 +1116,9 @@ function Step3({ event, people, onNext, onBack }) {
 
           <div className="btn-row">
             <button className="btn btn-ghost btn-sm" onClick={onBack}>← Back</button>
-            <button className="btn btn-primary" onClick={() => onNext(insights)}>
-              Compose Emails →
+            <button className="btn btn-primary"
+              onClick={() => downloadInsightsCSV(people, insights, event.name)}>
+              📥 Download CSV
             </button>
           </div>
         </>
@@ -1127,672 +1127,11 @@ function Step3({ event, people, onNext, onBack }) {
   );
 }
 
-/* ── Step 4 — Email Composer (Single + Bulk) ───────────────── */
-function Step4({ event, people, insights, onBack }) {
-  const [mode, setMode] = React.useState("single"); // "single" | "bulk"
-
-  return (
-    <div className="panel">
-      <div className="panel-title">Email Composer</div>
-      <div className="panel-sub">
-        Personalised pitch emails referencing <strong>{event.name}</strong>.
-      </div>
-
-      <div className="mode-toggle" style={{marginBottom:24}}>
-        <button className={`mode-btn ${mode==="single"?"active":""}`}
-          onClick={() => setMode("single")}>✉️ Single Email</button>
-        <button className={`mode-btn ${mode==="bulk"?"active":""}`}
-          onClick={() => setMode("bulk")}>📨 Bulk Send All ({people.length})</button>
-      </div>
-
-      {mode === "single"
-        ? <SingleEmail   event={event} people={people} insights={insights} onBack={onBack} />
-        : <BulkSend      event={event} people={people} insights={insights} onBack={onBack} />
-      }
-    </div>
-  );
-}
-
-/* ── Single Email ──────────────────────────────────────────── */
-function SingleEmail({ event, people, insights, onBack }) {
-  const [selectedId, setSelectedId] = React.useState("");
-  const [senderRole, setSenderRole] = React.useState("");
-  const [pitchAngle, setPitchAngle] = React.useState("");
-  const [email,      setEmail]      = React.useState(null);
-  const [loading,    setLoading]    = React.useState(false);
-  const [error,      setError]      = React.useState("");
-  const [copied,     setCopied]     = React.useState(false);
-
-  const insightMap = Object.fromEntries(insights.map(ins => [ins.id, ins]));
-  const person  = people.find(p => p.id === selectedId);
-  const insight = insightMap[selectedId];
-
-  async function compose() {
-    setLoading(true); setError(""); setEmail(null);
-    try {
-      const prompt = `Write a warm B2B outreach email from a Redcliffe Labs representative.
-Recipient: ${person.name}, ${person.title} at ${person.company}
-Their panel topic: "${person.topic}"
-Event: ${event.name}, ${event.city}
-Sender role at Redcliffe Labs: ${senderRole}
-Pitch angle: "${pitchAngle}"
-Hook: ${insight.hook}
-Key opportunity: ${insight.opportunity}
-Rules: body under 150 words, warm genuine tone, name the event, reference their topic,
-position Redcliffe Labs as India's corporate diagnostics partner, soft CTA: 15-min call,
-sign off: [Your Name], Redcliffe Labs.
-Return JSON only: { "subject": "under 65 chars", "body": "full email" }`;
-      const data = await callAI(prompt);
-      setEmail(data);
-    } catch(e) { setError(e.message); }
-    finally    { setLoading(false); }
-  }
-
-  function copyEmail() {
-    navigator.clipboard.writeText(`Subject: ${email.subject}\n\n${email.body}`)
-      .then(() => { setCopied(true); setTimeout(()=>setCopied(false), 2000); });
-  }
-
-  return (
-    <>
-      <div className="field-wrap">
-        <label className="field-label">Select Recipient</label>
-        <select className="text-input" value={selectedId}
-          onChange={e => { setSelectedId(e.target.value); setEmail(null); }}>
-          <option value="">— Choose a speaker —</option>
-          {people.map(p => (
-            <option key={p.id} value={p.id}>{p.name} · {p.title} at {p.company}</option>
-          ))}
-        </select>
-      </div>
-
-      <div className="field-wrap">
-        <label className="field-label">Your Role at Redcliffe Labs</label>
-        <input className="text-input"
-          placeholder="e.g. Corporate Partnerships Lead"
-          value={senderRole} onChange={e => setSenderRole(e.target.value)} />
-      </div>
-
-      <div className="field-wrap">
-        <label className="field-label">Pitch Angle</label>
-        <div className="pills-wrap">
-          {PITCH_ANGLES.map(a => (
-            <button key={a} className={`pill ${pitchAngle===a?"selected":""}`}
-              onClick={() => { setPitchAngle(a); setEmail(null); }}>{a}</button>
-          ))}
-        </div>
-      </div>
-
-      {error && <div className="error-alert">⚠ {error}</div>}
-
-      <div className="btn-row" style={{marginTop:0}}>
-        <button className="btn btn-ghost btn-sm" onClick={onBack}>← Back</button>
-        <button className="btn btn-primary"
-          disabled={!selectedId || !senderRole.trim() || !pitchAngle || loading}
-          onClick={compose}>✉️ Compose Email</button>
-      </div>
-
-      {loading && <Spinner label="Writing your personalised email…" />}
-
-      {email && (
-        <div className="email-output">
-          <div className="email-header-row">
-            <span className="email-field-label">To</span>
-            <span className="email-field-value">{person.name} &lt;{person.email_hint}&gt;</span>
-          </div>
-          <div className="email-header-row">
-            <span className="email-field-label">Subject</span>
-            <span className="email-field-value subject">{email.subject}</span>
-          </div>
-          <div className="email-body-wrap">
-            <pre className="email-body-text">{email.body}</pre>
-          </div>
-          <div className="email-actions">
-            <button className="btn btn-outline btn-sm" onClick={copyEmail}>
-              {copied ? "✓ Copied!" : "📋 Copy Email"}
-            </button>
-            <button className="btn btn-ghost btn-sm" onClick={compose}>🔄 Regenerate</button>
-          </div>
-        </div>
-      )}
-    </>
-  );
-}
-
-/* ── Bulk Send ─────────────────────────────────────────────── */
-const APOLLO_STATUS_CFG = {
-  verified:          { label:"✅ Verified",    color:"#10b981" },
-  likely_to_engage:  { label:"✓ Likely",       color:"#10b981" },
-  guessed:           { label:"🔍 Guessed",     color:"#f59e0b" },
-  not_found:         { label:"❌ Not found",   color:"#b91c1c" },
-  error:             { label:"⚠ Error",        color:"#b91c1c" },
-};
-
-function BulkSend({ event, people, insights, onBack }) {
-  /* ── sender config ── */
-  const [senderEmail, setSenderEmail] = React.useState("");
-  const [appPassword, setAppPassword] = React.useState("");
-  const [senderName,  setSenderName]  = React.useState("");
-  const [senderRole,  setSenderRole]  = React.useState("");
-  const [ccEmail,     setCcEmail]     = React.useState("");
-  const [pitchAngle,  setPitchAngle]  = React.useState(PITCH_ANGLES[0]);
-  const [testMode,    setTestMode]    = React.useState(true);
-  const [attachFile,  setAttachFile]  = React.useState(null);
-  const [apolloKey,   setApolloKey]   = React.useState("");
-
-  /* ── per-person editable state ── */
-  const [recipientMap, setRecipientMap] = React.useState(() =>
-    Object.fromEntries(people.map(p => [p.id, {
-      email: p.email_hint || "", included: true, apolloStatus: null,
-    }]))
-  );
-
-  /* ── flow step: "config" | "preview" | "done" ── */
-  const [bulkStep,  setBulkStep]  = React.useState("config");
-  const [previews,  setPreviews]  = React.useState({});   // {id: {subject, body, editedBody}}
-  const [expanded,  setExpanded]  = React.useState({});   // {id: bool}
-  const [loading,   setLoading]   = React.useState(false);
-  const [error,     setError]     = React.useState("");
-  const [results,   setResults]   = React.useState(null);
-  const [lookupBusy,setLookupBusy]= React.useState(false);
-
-  /* ── helpers ── */
-  function setRecipEmail(id, val) {
-    setRecipientMap(m => ({ ...m, [id]: { ...m[id], email: val, apolloStatus: null } }));
-  }
-  function toggleIncluded(id) {
-    setRecipientMap(m => ({ ...m, [id]: { ...m[id], included: !m[id].included } }));
-  }
-  function toggleAll(val) {
-    setRecipientMap(m => Object.fromEntries(
-      Object.entries(m).map(([k,v]) => [k, { ...v, included: val }])
-    ));
-  }
-  function setPreviewBody(id, val) {
-    setPreviews(p => ({ ...p, [id]: { ...p[id], editedBody: val } }));
-  }
-
-  const includedPeople  = people.filter(p => recipientMap[p.id]?.included);
-  const allChecked      = includedPeople.length === people.length;
-  const missingEmail    = includedPeople.filter(p => !(recipientMap[p.id]?.email||"").trim()).length;
-
-  async function readFileAsB64(file) {
-    return new Promise((res, rej) => {
-      const r = new FileReader();
-      r.onload  = () => res(r.result.split(",")[1]);
-      r.onerror = rej;
-      r.readAsDataURL(file);
-    });
-  }
-
-  /* ── Apollo: look up emails for checked people only ── */
-  async function findViaApollo() {
-    if (!apolloKey.trim()) { setError("Enter your Apollo API key first"); return; }
-    setLookupBusy(true); setError("");
-    try {
-      const toFind = includedPeople.map(p => ({
-        id: p.id, name: p.name, company: p.company, title: p.title,
-      }));
-      const res = await fetch("/api/find-emails", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ apollo_key: apolloKey.trim(), people: toFind }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-      setRecipientMap(m => {
-        const next = { ...m };
-        Object.entries(data.results).forEach(([id, r]) => {
-          if (next[id]) {
-            next[id] = {
-              ...next[id],
-              email:        r.email || next[id].email,
-              apolloStatus: r.status || (r.found ? "verified" : "not_found"),
-            };
-          }
-        });
-        return next;
-      });
-    } catch(e) { setError(e.message); }
-    finally    { setLookupBusy(false); }
-  }
-
-  /* ── Step 1 → Step 2: generate previews ── */
-  async function generatePreviews() {
-    setLoading(true); setError("");
-    try {
-      const enriched = includedPeople.map(p => ({
-        ...p, email_hint: (recipientMap[p.id]?.email || "").trim(),
-      }));
-      const res = await fetch("/api/preview-bulk", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          event,
-          people:      enriched,
-          insights:    insights.filter(ins => enriched.some(p => p.id === ins.id)),
-          sender_name: senderName.trim() || "Redcliffe Labs",
-          sender_role: senderRole.trim() || "Corporate Partnerships",
-          pitch_angle: pitchAngle,
-          openai_key: getOpenAIKey(),
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-      // store previews with an editable copy of body
-      const pvMap = {};
-      Object.entries(data.previews).forEach(([id, pv]) => {
-        pvMap[id] = { ...pv, editedBody: pv.body };
-      });
-      setPreviews(pvMap);
-      setBulkStep("preview");
-    } catch(e) { setError(e.message); }
-    finally    { setLoading(false); }
-  }
-
-  /* ── Step 2 → send ── */
-  async function sendAll() {
-    setLoading(true); setError("");
-    try {
-      let attachment_b64 = "", attachment_name = "";
-      if (attachFile) {
-        attachment_b64  = await readFileAsB64(attachFile);
-        attachment_name = attachFile.name;
-      }
-      const enriched = includedPeople.map(p => ({
-        ...p, email_hint: (recipientMap[p.id]?.email || "").trim(),
-      }));
-      // Send the (possibly edited) preview content — no re-generation cost
-      const previewsToSend = Object.fromEntries(
-        Object.entries(previews).map(([id, pv]) => [id, {
-          subject: pv.subject,
-          body:    pv.editedBody || pv.body,
-        }])
-      );
-      const res = await fetch("/api/send-bulk", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sender_email: senderEmail.trim(), sender_password: appPassword,
-          sender_name:  senderName.trim() || "Redcliffe Labs",
-          sender_role:  senderRole.trim() || "Corporate Partnerships",
-          cc_email:     ccEmail.trim(),
-          test_mode:    testMode, pitch_angle: pitchAngle,
-          event, people: enriched,
-          insights:     insights.filter(ins => enriched.some(p => p.id === ins.id)),
-          previews:     previewsToSend,
-          attachment_b64, attachment_name,
-          openai_key: getOpenAIKey(),
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-      setResults(data);
-      setBulkStep("done");
-    } catch(e) { setError(e.message); }
-    finally    { setLoading(false); }
-  }
-
-  const canPreview = senderName.trim() && senderRole.trim() && includedPeople.length > 0;
-  const canSend    = canPreview && senderEmail.trim() && appPassword;
-
-  /* ════════════════ STEP: config ════════════════ */
-  if (bulkStep === "config") return (
-    <>
-      <div className="info-note" style={{marginBottom:18}}>
-        📨 <strong>Step 1 of 3:</strong> Configure sender, find verified emails via Apollo, then preview before sending.
-      </div>
-
-      {/* Gmail config */}
-      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
-        <div className="field-wrap" style={{marginBottom:0}}>
-          <label className="field-label">Your Gmail</label>
-          <input className="text-input" type="email" placeholder="you@gmail.com"
-            value={senderEmail} onChange={e => setSenderEmail(e.target.value)} />
-        </div>
-        <div className="field-wrap" style={{marginBottom:0}}>
-          <label className="field-label">Gmail App Password
-            <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener noreferrer"
-              style={{marginLeft:5,color:"var(--primary)",fontSize:10}}> How to get ↗</a>
-          </label>
-          <input className="text-input" type="password" placeholder="xxxx xxxx xxxx xxxx"
-            value={appPassword} onChange={e => setAppPassword(e.target.value)} />
-        </div>
-        <div className="field-wrap" style={{marginBottom:0}}>
-          <label className="field-label">Your Name</label>
-          <input className="text-input" placeholder="e.g. Nikhil Sharma"
-            value={senderName} onChange={e => setSenderName(e.target.value)} />
-        </div>
-        <div className="field-wrap" style={{marginBottom:0}}>
-          <label className="field-label">Your Role</label>
-          <input className="text-input" placeholder="e.g. Corporate Partnerships Lead"
-            value={senderRole} onChange={e => setSenderRole(e.target.value)} />
-        </div>
-        <div className="field-wrap" style={{marginBottom:0}}>
-          <label className="field-label">CC (optional)</label>
-          <input className="text-input" placeholder="e.g. manager@redcliffelabs.com"
-            value={ccEmail} onChange={e => setCcEmail(e.target.value)} />
-        </div>
-      </div>
-
-      {/* Pitch angle */}
-      <div className="field-wrap">
-        <label className="field-label">Pitch Angle</label>
-        <div className="pills-wrap">
-          {PITCH_ANGLES.map(a => (
-            <button key={a} className={`pill ${pitchAngle===a?"selected":""}`}
-              onClick={() => setPitchAngle(a)}>{a}</button>
-          ))}
-        </div>
-      </div>
-
-      {/* Attachment */}
-      <div className="field-wrap">
-        <label className="field-label">Attachment (optional)</label>
-        <label className="attach-label">
-          📎 {attachFile ? attachFile.name : "Click to add PDF brochure / deck"}
-          <input type="file" style={{display:"none"}} accept=".pdf,.pptx,.docx,.jpg,.png"
-            onChange={e => setAttachFile(e.target.files[0]||null)} />
-        </label>
-        {attachFile && (
-          <div className="attach-chosen">
-            ✓ {attachFile.name} ({(attachFile.size/1024).toFixed(0)} KB)
-            <button onClick={() => setAttachFile(null)}
-              style={{marginLeft:8,border:"none",background:"none",color:"#b91c1c",cursor:"pointer",fontSize:12}}>
-              ✕
-            </button>
-          </div>
-        )}
-      </div>
-
-      {/* Test mode */}
-      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:18,
-                   padding:"11px 14px",background:"var(--surface-2)",
-                   border:"1px solid var(--border)",borderRadius:"var(--radius-sm)"}}>
-        <input type="checkbox" id="tm2" checked={testMode}
-          onChange={e => setTestMode(e.target.checked)} style={{width:16,height:16,cursor:"pointer"}} />
-        <label htmlFor="tm2" style={{cursor:"pointer",flex:1}}>
-          <span style={{fontWeight:600,fontSize:13}}>
-            Test Mode {testMode && <span className="test-badge">🧪 ON</span>}
-          </span>
-          <div style={{fontSize:12,color:"var(--text-2)",marginTop:1}}>
-            {testMode
-              ? `All emails → YOUR inbox (${senderEmail||"your Gmail"}) so you can review before real send.`
-              : "⚠ Real Mode — emails go to the actual speaker addresses."}
-          </div>
-        </label>
-      </div>
-
-      {/* ── Recipients table with Apollo lookup ── */}
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6,flexWrap:"wrap",gap:8}}>
-        <div className="section-title" style={{marginBottom:0}}>
-          Recipients — {includedPeople.length}/{people.length} selected
-          {missingEmail > 0 && <span style={{marginLeft:8,fontSize:11,color:"#b45309",fontWeight:500}}>⚠ {missingEmail} missing email</span>}
-        </div>
-        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-          <button className="btn btn-ghost btn-sm" style={{padding:"4px 8px",fontSize:11}} onClick={() => toggleAll(true)}>All</button>
-          <button className="btn btn-ghost btn-sm" style={{padding:"4px 8px",fontSize:11}} onClick={() => toggleAll(false)}>None</button>
-        </div>
-      </div>
-
-      {/* Apollo key + find button */}
-      <div style={{display:"flex",gap:8,marginBottom:10,alignItems:"center",flexWrap:"wrap"}}>
-        <input className="text-input" style={{flex:1,minWidth:200,fontSize:12}}
-          type="password" placeholder="Apollo API key (for verified emails) — get free at apollo.io"
-          value={apolloKey} onChange={e => setApolloKey(e.target.value)} />
-        <button className="btn btn-outline btn-sm"
-          disabled={!apolloKey.trim() || lookupBusy || includedPeople.length===0}
-          onClick={findViaApollo} style={{whiteSpace:"nowrap"}}>
-          {lookupBusy ? "Searching…" : `🔍 Find Emails (${includedPeople.length} selected)`}
-        </button>
-      </div>
-
-      <div style={{border:"1.5px solid var(--border)",borderRadius:"var(--radius-sm)",overflow:"auto"}}>
-        <table className="bulk-table" style={{margin:0}}>
-          <thead>
-            <tr>
-              <th style={{width:34,textAlign:"center"}}>
-                <input type="checkbox" checked={allChecked}
-                  onChange={e => toggleAll(e.target.checked)} style={{cursor:"pointer"}} />
-              </th>
-              <th>Name · Company</th>
-              <th style={{minWidth:230}}>
-                Email
-                <span style={{marginLeft:5,fontSize:10,color:"var(--text-3)",fontWeight:400,textTransform:"none"}}>
-                  edit / paste verified address
-                </span>
-              </th>
-              <th style={{width:100}}>Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            {people.map((p,i) => {
-              const rec      = recipientMap[p.id] || {};
-              const included = rec.included !== false;
-              const emailVal = rec.email || "";
-              const isEmpty  = !emailVal.trim();
-              const ast      = rec.apolloStatus;
-              const astCfg   = ast ? (APOLLO_STATUS_CFG[ast] || APOLLO_STATUS_CFG.not_found) : null;
-              return (
-                <tr key={p.id} style={{opacity:included?1:0.4,background:included?"":"var(--surface-2)"}}>
-                  <td style={{textAlign:"center"}}>
-                    <input type="checkbox" checked={included}
-                      onChange={() => toggleIncluded(p.id)} style={{cursor:"pointer"}} />
-                  </td>
-                  <td>
-                    <div style={{display:"flex",alignItems:"center",gap:7}}>
-                      <div className="avatar" style={{width:26,height:26,fontSize:11,borderRadius:6,flexShrink:0,
-                        background:AVATAR_COLORS[i%AVATAR_COLORS.length]}}>
-                        {getInitials(p.name)}
-                      </div>
-                      <div>
-                        <div style={{fontWeight:600,fontSize:12,lineHeight:1.3}}>{p.name}</div>
-                        <div style={{fontSize:11,color:"var(--primary)"}}>{p.company}</div>
-                      </div>
-                    </div>
-                  </td>
-                  <td>
-                    <input type="email" value={emailVal}
-                      placeholder="paste or type email…"
-                      onChange={e => setRecipEmail(p.id, e.target.value)}
-                      style={{width:"100%",padding:"4px 8px",
-                        border:`1.5px solid ${isEmpty&&included?"#fca5a5":"var(--border)"}`,
-                        borderRadius:5,background:"var(--surface)",color:"var(--text)",
-                        fontSize:12,fontFamily:"monospace",outline:"none"}}
-                      onFocus={e=>e.target.style.borderColor="var(--primary)"}
-                      onBlur={e=>e.target.style.borderColor=isEmpty&&included?"#fca5a5":"var(--border)"}
-                    />
-                  </td>
-                  <td style={{fontSize:11,fontWeight:600,color:astCfg?.color||"var(--text-3)"}}>
-                    {astCfg ? astCfg.label : (emailVal ? "✏ Manual" : "—")}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-      <div style={{fontSize:11,color:"var(--text-3)",marginTop:5}}>
-        💡 Red border = missing email. Apollo finds verified addresses — only charges credits for selected people.
-      </div>
-
-      {error && <div className="error-alert" style={{marginTop:12}}>⚠ {error}</div>}
-      {loading && <Spinner label="Generating email previews…" />}
-
-      {!loading && (
-        <div className="btn-row">
-          <button className="btn btn-ghost btn-sm" onClick={onBack}>← Back</button>
-          <button className="btn btn-primary" disabled={!canPreview} onClick={generatePreviews}>
-            👁 Preview Emails ({includedPeople.length}) →
-          </button>
-        </div>
-      )}
-    </>
-  );
-
-  /* ════════════════ STEP: preview ════════════════ */
-  if (bulkStep === "preview") return (
-    <>
-      <div className="info-note" style={{marginBottom:16}}>
-        👁 <strong>Step 2 of 3:</strong> Review every email below. Click to expand, edit the body if needed, then send.
-        {testMode && <span className="test-badge" style={{marginLeft:8}}>🧪 Test Mode ON</span>}
-      </div>
-
-      {includedPeople.map((p,i) => {
-        const pv   = previews[p.id] || {};
-        const open = expanded[p.id];
-        const rec  = recipientMap[p.id] || {};
-        return (
-          <div key={p.id} style={{border:"1.5px solid var(--border)",borderRadius:"var(--radius-sm)",
-                                   marginBottom:8,overflow:"hidden"}}>
-            {/* Header row */}
-            <div style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",
-                         background:"var(--surface-2)",cursor:"pointer"}}
-              onClick={() => setExpanded(e => ({...e, [p.id]: !e[p.id]}))}>
-              <div className="avatar" style={{width:28,height:28,fontSize:11,borderRadius:7,flexShrink:0,
-                background:AVATAR_COLORS[i%AVATAR_COLORS.length]}}>
-                {getInitials(p.name)}
-              </div>
-              <div style={{flex:1,minWidth:0}}>
-                <div style={{fontWeight:600,fontSize:13}}>{p.name}
-                  <span style={{fontWeight:400,color:"var(--text-3)",marginLeft:6,fontSize:12}}>
-                    → {rec.email||"no email"}
-                  </span>
-                </div>
-                <div style={{fontSize:12,color:"var(--text-3)",overflow:"hidden",
-                             textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                  {pv.subject||"—"}
-                </div>
-              </div>
-              <span style={{fontSize:18,color:"var(--text-3)",flexShrink:0}}>{open?"▲":"▼"}</span>
-            </div>
-
-            {/* Expandable email body */}
-            {open && (
-              <div style={{padding:"12px 14px",borderTop:"1px solid var(--border)"}}>
-                <div style={{fontSize:11,fontWeight:700,color:"var(--text-3)",
-                             textTransform:"uppercase",letterSpacing:".05em",marginBottom:4}}>
-                  Subject
-                </div>
-                <div style={{fontSize:13,fontWeight:600,marginBottom:10}}>{pv.subject}</div>
-                <div style={{fontSize:11,fontWeight:700,color:"var(--text-3)",
-                             textTransform:"uppercase",letterSpacing:".05em",marginBottom:4}}>
-                  Body <span style={{fontWeight:400,textTransform:"none",fontSize:11}}>(editable)</span>
-                </div>
-                <textarea
-                  value={pv.editedBody || pv.body || ""}
-                  onChange={e => setPreviewBody(p.id, e.target.value)}
-                  style={{width:"100%",minHeight:160,padding:"10px 12px",
-                          border:"1.5px solid var(--border)",borderRadius:6,
-                          background:"var(--surface)",color:"var(--text)",
-                          fontSize:13,fontFamily:"inherit",lineHeight:1.65,
-                          resize:"vertical",outline:"none"}}
-                  onFocus={e=>e.target.style.borderColor="var(--primary)"}
-                  onBlur={e=>e.target.style.borderColor="var(--border)"}
-                />
-              </div>
-            )}
-          </div>
-        );
-      })}
-
-      {error && <div className="error-alert" style={{marginTop:12}}>⚠ {error}</div>}
-      {loading && <Spinner label={`Sending ${includedPeople.length} emails…`} />}
-
-      {!loading && (
-        <div className="btn-row">
-          <button className="btn btn-ghost btn-sm" onClick={() => setBulkStep("config")}>← Edit Recipients</button>
-          <button className="btn btn-primary" disabled={!canSend} onClick={sendAll}>
-            {testMode
-              ? `🧪 Send Test (${includedPeople.length} → my inbox)`
-              : `📨 Send for Real (${includedPeople.length} emails)`}
-          </button>
-        </div>
-      )}
-    </>
-  );
-
-  /* ════════════════ STEP: done ════════════════ */
-  return (
-    <>
-      <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:12}}>
-        <span style={{fontWeight:700,fontSize:15}}>
-          ✅ {results.sent}/{results.total} sent
-          {results.test_mode && <span className="test-badge" style={{marginLeft:8}}>🧪 Test Mode</span>}
-        </span>
-        {results.failed > 0 && <span style={{fontSize:13,color:"#b91c1c"}}>{results.failed} failed</span>}
-      </div>
-      <table className="bulk-table">
-        <thead>
-          <tr><th>Name</th><th>Sent To</th><th>Subject</th><th>Status</th></tr>
-        </thead>
-        <tbody>
-          {results.results.map((r,i) => (
-            <tr key={i}>
-              <td style={{fontWeight:600}}>{r.name}</td>
-              <td style={{fontSize:11,color:"var(--text-3)",fontFamily:"monospace"}}>{r.sent_to||"—"}</td>
-              <td style={{fontSize:12,color:"var(--text-2)",maxWidth:200,overflow:"hidden",
-                          textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.subject||"—"}</td>
-              <td>
-                <span className={`status-dot ${r.status}`}>
-                  {r.status==="sent"?"✅ Sent":r.status==="skipped"?"⏭ Skipped":"❌ Error"}
-                </span>
-                {r.reason && <div style={{fontSize:11,color:"var(--text-3)",marginTop:2}}>{r.reason}</div>}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      <div className="btn-row">
-        <button className="btn btn-ghost btn-sm" onClick={() => { setBulkStep("config"); setResults(null); }}>
-          ↺ Start Over
-        </button>
-        {results.test_mode && (
-          <button className="btn btn-primary" onClick={() => { setTestMode(false); setBulkStep("preview"); }}>
-            📨 Send for Real →
-          </button>
-        )}
-      </div>
-    </>
-  );
-}
-
-/* ── OpenAI key field (header) ─────────────────────────────── */
-function OpenAIKeyField() {
-  const [key,   setKey]   = React.useState(getOpenAIKey());
-  const [saved, setSaved] = React.useState(!!getOpenAIKey());
-
-  function handleChange(e) {
-    const v = e.target.value;
-    setKey(v);
-    setOpenAIKey(v.trim());
-    setSaved(!!v.trim());
-  }
-
-  return (
-    <div style={{display:"flex",alignItems:"center",gap:6,marginLeft:"auto"}}>
-      <input
-        className="text-input"
-        style={{width:220,fontSize:12}}
-        type="password"
-        placeholder="Your OpenAI API key"
-        value={key}
-        onChange={handleChange}
-        title="Stored only in your browser (localStorage) — sent to our server per-request to call OpenAI on your behalf."
-      />
-      <span style={{fontSize:11,fontWeight:600,color: saved ? "#10b981" : "#94a3b8",whiteSpace:"nowrap"}}>
-        {saved ? "● key set" : "○ no key"}
-      </span>
-    </div>
-  );
-}
-
 /* ── App ───────────────────────────────────────────────────── */
 function App() {
-  const [step,     setStep]     = React.useState(0);
-  const [event,    setEvent]    = React.useState(null);
-  const [people,   setPeople]   = React.useState([]);
-  const [insights, setInsights] = React.useState([]);
+  const [step,   setStep]   = React.useState(0);
+  const [event,  setEvent]  = React.useState(null);
+  const [people, setPeople] = React.useState([]);
 
   return (
     <div>
@@ -1822,16 +1161,7 @@ function App() {
           <Step3
             event={event}
             people={people}
-            onNext={ins => { setInsights(ins); setStep(3); }}
             onBack={() => setStep(1)}
-          />
-        )}
-        {step === 3 && event && people.length > 0 && insights.length > 0 && (
-          <Step4
-            event={event}
-            people={people}
-            insights={insights}
-            onBack={() => setStep(2)}
           />
         )}
       </main>
