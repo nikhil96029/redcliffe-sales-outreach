@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: redcliffe-outreach
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
+    envVars:
+      - key: GSHEET_WEBHOOK_URL
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.12.0
