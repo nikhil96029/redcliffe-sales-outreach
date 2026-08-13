@@ -1127,6 +1127,36 @@ function Step3({ event, people, onBack }) {
   );
 }
 
+/* ── OpenAI key field (header) ─────────────────────────────── */
+function OpenAIKeyField() {
+  const [key,   setKey]   = React.useState(getOpenAIKey());
+  const [saved, setSaved] = React.useState(!!getOpenAIKey());
+
+  function handleChange(e) {
+    const v = e.target.value;
+    setKey(v);
+    setOpenAIKey(v.trim());
+    setSaved(!!v.trim());
+  }
+
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:6,marginLeft:"auto"}}>
+      <input
+        className="text-input"
+        style={{width:220,fontSize:12}}
+        type="password"
+        placeholder="Your OpenAI API key"
+        value={key}
+        onChange={handleChange}
+        title="Stored only in your browser (localStorage) — sent to our server per-request to call OpenAI on your behalf."
+      />
+      <span style={{fontSize:11,fontWeight:600,color: saved ? "#10b981" : "#94a3b8",whiteSpace:"nowrap"}}>
+        {saved ? "● key set" : "○ no key"}
+      </span>
+    </div>
+  );
+}
+
 /* ── App ───────────────────────────────────────────────────── */
 function App() {
   const [step,   setStep]   = React.useState(0);
