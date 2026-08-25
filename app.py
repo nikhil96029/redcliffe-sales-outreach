@@ -11,12 +11,31 @@ load_dotenv()
 app = Flask(__name__)
 
 def safe_search_extract(resp_json):
-    """Return (raw_text, annotations) or raise ValueError with the API error message."""
-    if "choices" not in resp_json:
+    """Return (raw_text, annotations) from a Responses API result, or raise ValueError with the API error message."""
+    if "output" not in resp_json:
         err = resp_json.get("error", {})
         raise ValueError(err.get("message", str(resp_json)))
-    msg = resp_json["choices"][0]["message"]
-    return msg["content"], msg.get("annotations", [])
+    for item in resp_json["output"]:
+        if item.get("type") == "message":
+            for c in item.get("content", []):
+                if c.get("type") == "output_text":
+                    return c.get("text", ""), c.get("annotations", [])
+    raise ValueError("No search results returned")
+
+
+def web_search_call(headers, prompt, search_context_size="medium", timeout=90):
+    """POST to the Responses API with the web_search tool. Returns the parsed JSON response."""
+    resp = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers=headers,
+        json={
+            "model": "gpt-5.6-terra",
+            "tools": [{"type": "web_search", "search_context_size": search_context_size}],
+            "input": prompt,
+        },
+        timeout=timeout,
+    )
+    return resp.json()
 
 
 def gpt_format(headers, prompt, max_tokens=4096):
@@ -67,7 +86,7 @@ def serve_app():
 
 @app.route("/api/search-events", methods=["POST"])
 def search_events():
-    """Two-step: gpt-4o-search-preview finds real events, gpt-4o formats to JSON."""
+    """Two-step: gpt-5.6-terra web search finds real events, gpt-4o-mini formats to JSON."""
     data = request.get_json(force=True)
     openai_key = resolve_openai_key(data)
     if not openai_key:
@@ -134,17 +153,7 @@ def search_events():
     )
 
     try:
-        search_resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json={
-                "model": "gpt-4o-mini-search-preview",
-                "web_search_options": {"search_context_size": "medium"},
-                "messages": [{"role": "user", "content": search_prompt}],
-            },
-            timeout=90,
-        )
-        search_data = search_resp.json()
+        search_data = web_search_call(headers, search_prompt, search_context_size="medium")
 
         # Surface API-level errors (quota, invalid key, model error, etc.)
         try:
@@ -153,9 +162,9 @@ def search_events():
             return jsonify({"error": f"OpenAI search error: {ve}"}), 502
 
         real_urls = [
-            a["url_citation"]["url"]
+            a["url"]
             for a in annotations
-            if a.get("type") == "url_citation" and "url_citation" in a
+            if a.get("type") == "url_citation" and "url" in a
         ]
 
         # ── Step 2: reformat raw text → clean JSON ───────────────────────
@@ -255,17 +264,7 @@ def search_speakers():
     )
 
     try:
-        search_resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json={
-                "model": "gpt-4o-mini-search-preview",
-                "web_search_options": {"search_context_size": "low"},
-                "messages": [{"role": "user", "content": search_prompt}],
-            },
-            timeout=90,
-        )
-        search_data = search_resp.json()
+        search_data = web_search_call(headers, search_prompt, search_context_size="low")
         try:
             raw_text, annotations = safe_search_extract(search_data)
         except ValueError as ve:
@@ -273,11 +272,11 @@ def search_speakers():
 
         source_links = [
             {
-                "url":   a["url_citation"]["url"],
-                "title": a["url_citation"].get("title", a["url_citation"]["url"]),
+                "url":   a["url"],
+                "title": a.get("title", a["url"]),
             }
             for a in annotations
-            if a.get("type") == "url_citation" and "url_citation" in a
+            if a.get("type") == "url_citation" and "url" in a
         ]
         real_urls = [s["url"] for s in source_links]
 
@@ -361,17 +360,7 @@ def search_insights():
     )
 
     try:
-        search_resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json={
-                "model": "gpt-4o-mini-search-preview",
-                "web_search_options": {"search_context_size": "low"},
-                "messages": [{"role": "user", "content": search_prompt}],
-            },
-            timeout=90,
-        )
-        search_data = search_resp.json()
+        search_data = web_search_call(headers, search_prompt, search_context_size="low")
         try:
             raw_text, annotations = safe_search_extract(search_data)
         except ValueError as ve:
@@ -379,11 +368,11 @@ def search_insights():
 
         source_links = [
             {
-                "url":   a["url_citation"]["url"],
-                "title": a["url_citation"].get("title", a["url_citation"]["url"]),
+                "url":   a["url"],
+                "title": a.get("title", a["url"]),
             }
             for a in annotations
-            if a.get("type") == "url_citation" and "url_citation" in a
+            if a.get("type") == "url_citation" and "url" in a
         ]
         real_urls = [s["url"] for s in source_links]
 
@@ -507,17 +496,11 @@ Return as {{\"result\": [{{...}}]}} with exactly one event:
             f"Today is {today}."
         )
         try:
-            search_resp = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers_ai,
-                json={
-                    "model": "gpt-4o-mini-search-preview",
-                    "web_search_options": {"search_context_size": "low"},
-                    "messages": [{"role": "user", "content": search_prompt}],
-                },
-                timeout=90,
-            )
-            raw_text = search_resp.json()["choices"][0]["message"]["content"]
+            search_data = web_search_call(headers_ai, search_prompt, search_context_size="low")
+            try:
+                raw_text, _ = safe_search_extract(search_data)
+            except ValueError as ve:
+                return jsonify({"error": f"OpenAI search error: {ve}"}), 502
 
             format_prompt = f"""Today is {today}. Extract the India-based event details from this web search result.
 
@@ -580,26 +563,16 @@ def event_recap():
     )
 
     try:
-        search_resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers_ai,
-            json={
-                "model": "gpt-4o-mini-search-preview",
-                "web_search_options": {"search_context_size": "low"},
-                "messages": [{"role": "user", "content": search_prompt}],
-            },
-            timeout=90,
-        )
-        search_data = search_resp.json()
+        search_data = web_search_call(headers_ai, search_prompt, search_context_size="low")
         try:
             raw_text, annotations = safe_search_extract(search_data)
         except ValueError as ve:
             return jsonify({"error": f"OpenAI search error: {ve}"}), 502
 
         source_links = [
-            {"url": a["url_citation"]["url"], "title": a["url_citation"].get("title", "")}
+            {"url": a["url"], "title": a.get("title", "")}
             for a in annotations
-            if a.get("type") == "url_citation" and "url_citation" in a
+            if a.get("type") == "url_citation" and "url" in a
         ]
 
         status_code, fd = gpt_format(headers_ai, f"""Summarise what happened at this event based on real web search results.
