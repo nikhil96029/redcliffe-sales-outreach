@@ -1,13 +1,8 @@
 import os
 import json
 import time
-import base64
 import requests
 from datetime import datetime, timedelta
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
 from flask import Flask, request, jsonify, send_file
 from dotenv import load_dotenv
 
@@ -28,7 +23,7 @@ def safe_search_extract(resp_json):
     raise ValueError("No search results returned")
 
 
-def web_search_call(headers, prompt, search_context_size="medium", timeout=90):
+def web_search_call(headers, prompt, search_context_size="medium", timeout=180):
     """POST to the Responses API with the web_search tool. Returns the parsed JSON response."""
     resp = requests.post(
         "https://api.openai.com/v1/responses",
@@ -57,7 +52,7 @@ def gpt_format(headers, prompt, max_tokens=4096):
                 {"role": "user",   "content": prompt},
             ],
         },
-        timeout=90,
+        timeout=120,
     )
     data = resp.json()
     if "choices" in data:
@@ -73,7 +68,7 @@ def gpt_format(headers, prompt, max_tokens=4096):
             pass  # leave as-is; frontend parseJSON will handle fences
     return resp.status_code, data
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_API_KEY     = os.environ.get("OPENAI_API_KEY", "")
 BASE = os.path.abspath(os.path.dirname(__file__))
 
 def resolve_openai_key(data):
@@ -129,24 +124,17 @@ def search_events():
         f"- ONLY events physically held in Indian cities (Mumbai, Delhi, Bengaluru, Pune, Hyderabad, Chennai, Kolkata, Ahmedabad, Gurugram, Noida, Jaipur, etc).\n"
         f"- DO NOT include events from USA, UK, Singapore, Dubai, or any country outside India.\n"
         f"- Return REAL events with REAL dates — no fabricated events.\n\n"
-        f"SEARCH STRATEGY — run ALL of these searches:\n\n"
-        f"Search 1 — Event aggregators (comprehensive databases):\n"
-        f"  - 10times.com: search '{category} India {this_month}' and '{category} India {next_month}'\n"
-        f"  - eventzilla.in, townscript.com, eventshigh.com, allevents.in: same queries\n\n"
+        f"SEARCH STRATEGY — run these 3 searches (combine sources within each, don't run them one by one):\n\n"
+        f"Search 1 — Event aggregators + direct event sites:\n"
+        f"  - 10times.com, allevents.in, townscript.com, eventshigh.com: '{category} India {this_month}' and '{category} India {next_month}'\n"
+        f"  - '{category} India 2026 registration' — to catch official event sites\n\n"
         f"Search 2 — Broad Google with event format variants:\n"
-        f"  - '{category} summit India {this_month}'\n"
-        f"  - '{category} conclave India 2026'\n"
-        f"  - '{category} conference roundtable forum India {date_range}'\n"
-        f"  - '{category} India {date_range} agenda speakers'\n\n"
+        f"  - '{category} summit India {this_month}', '{category} conclave India 2026'\n"
+        f"  - '{category} conference roundtable forum India {date_range} agenda speakers'\n"
+        f"  - Industry media: economictimes.com, hrworld.in, peoplemattersglobal.com, ethrworld.com '{category} event India {date_range}'\n\n"
         f"Search 3 — LinkedIn (events are often ONLY posted here):\n"
         f"  - site:linkedin.com/events '{category}' India 2026\n"
-        f"  - site:linkedin.com/posts '{category}' summit India {this_month}\n"
-        f"  - site:linkedin.com '{category}' conclave India {date_range}\n\n"
-        f"Search 4 — Industry news and media:\n"
-        f"  - economictimes.com, businessline.com, hrworld.in, peoplemattersglobal.com, ethrworld.com, businesstoday.in\n"
-        f"  - Search: '{category} event India {date_range}'\n\n"
-        f"Search 5 — Direct event website search:\n"
-        f"  - '{category} India 2026 registration' — to find official event sites\n\n"
+        f"  - site:linkedin.com/posts '{category}' summit OR conclave India {this_month}\n\n"
         f"For EACH event found, provide:\n"
         f"  - Exact event name (as it appears on the source)\n"
         f"  - Exact date or date range\n"
@@ -721,173 +709,6 @@ def preview_bulk():
             previews[pid] = {"subject": f"Partnership — {event.get('name','')}", "body": ""}
 
     return jsonify({"previews": previews})
-
-
-@app.route("/api/send-bulk", methods=["POST"])
-def send_bulk():
-    """Generate personalised emails for every speaker and send via the Gmail API (OAuth access token)."""
-    data            = request.get_json(force=True)
-    openai_key      = resolve_openai_key(data)
-    if not openai_key:
-        return jsonify({"error": "OpenAI API key required. Enter it in the top-right field or add OPENAI_API_KEY to .env"}), 400
-    access_token    = data.get("access_token", "").strip()
-    sender_email    = data.get("sender_email", "").strip()
-    sender_name     = data.get("sender_name", "Redcliffe Labs").strip()
-    sender_role     = data.get("sender_role", "Corporate Partnerships").strip()
-    cc_email        = data.get("cc_email", "").strip()
-    test_mode       = data.get("test_mode", True)
-    event           = data.get("event", {})
-    people          = data.get("people", [])
-    insights        = data.get("insights", [])
-    pitch_angle     = data.get("pitch_angle", "I heard your panel session")
-    attachment_b64  = data.get("attachment_b64", "")
-    attachment_name = data.get("attachment_name", "")
-    previews_in     = data.get("previews", {})   # pre-generated email content — skip re-gen if present
-
-    if not access_token or not sender_email:
-        return jsonify({"error": "Google sign-in required — click 'Sign in with Google' first"}), 401
-    if not people:
-        return jsonify({"error": "No speakers to send to"}), 400
-
-    insight_map   = {ins["id"]: ins for ins in insights}
-    headers_ai    = {"Content-Type": "application/json",
-                      "Authorization": f"Bearer {openai_key}"}
-    gmail_headers = {"Content-Type": "application/json",
-                      "Authorization": f"Bearer {access_token}"}
-
-    results = []
-    event_name = event.get("name", "")
-    event_city = event.get("city", "")
-
-    # In test mode send only the first person as a sample — rest marked as pending
-    people_to_send = people[:1] if test_mode else people
-    for p in people[1:] if test_mode else []:
-        results.append({"name": p.get("name",""), "company": p.get("company",""),
-                        "sent_to": "—", "subject": "—", "status": "pending (test mode)"})
-
-    for person in people_to_send:
-        insight = insight_map.get(person.get("id", ""), {})
-        name    = person.get("name", "")
-        title   = person.get("title", "")
-        company = person.get("company", "")
-        topic   = person.get("topic", "")
-        hook    = insight.get("hook", "")
-        opp     = insight.get("opportunity", "")
-        email_to = person.get("email_hint", "")
-
-        # ── Use pre-generated content if available, else generate ────
-        pid = person.get("id", "")
-        if pid in previews_in and previews_in[pid].get("body"):
-            subject = previews_in[pid].get("subject", f"Partnership — {event_name}")
-            body    = previews_in[pid].get("body", "")
-        else:
-            gen_prompt = (
-                f"Write a warm B2B outreach email from {sender_name}, {sender_role} at Redcliffe Labs.\n"
-                f"Recipient: {name}, {title} at {company}\n"
-                f"Event: {event_name}, {event_city}\n"
-                f"Their session: {topic}\nPitch angle: {pitch_angle}\n"
-                f"Hook: {hook}\nKey opportunity: {opp}\n\n"
-                f"Rules: body under 120 words, warm tone, name event+session, 15-min CTA, "
-                f"sign: {sender_name}, {sender_role}, Redcliffe Labs.\n"
-                f'Return JSON: {{"subject":"...","body":"..."}}'
-            )
-            try:
-                gen_resp = requests.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers=headers_ai,
-                    json={
-                        "model": "gpt-4o-mini",
-                        "max_tokens": 400,
-                        "temperature": 0.7,
-                        "response_format": {"type": "json_object"},
-                        "messages": [
-                            {"role": "system", "content": "Return JSON with subject and body only."},
-                            {"role": "user",   "content": gen_prompt},
-                        ],
-                    },
-                    timeout=30,
-                )
-                ec = gen_resp.json()
-                if "choices" not in ec:
-                    raise ValueError("generation failed")
-                content = json.loads(ec["choices"][0]["message"]["content"])
-                subject = content.get("subject", f"Partnership — {event_name}")
-                body    = content.get("body", "")
-            except Exception as exc:
-                results.append({"name": name, "status": "error", "reason": f"Generation failed: {exc}"})
-                continue
-
-        # ── Build MIME message ───────────────────────────────────────
-        msg = MIMEMultipart()
-        msg["From"]    = f"{sender_name} <{sender_email}>"
-        msg["Subject"] = (f"[TEST → {name}] " if test_mode else "") + subject
-
-        if test_mode:
-            # In test mode always deliver to sender so they can review
-            msg["To"]      = sender_email
-            msg["X-Intended-To"] = email_to
-            body = f"[TEST — intended recipient: {name} <{email_to}>]\n\n{body}"
-            actual_to = sender_email
-        else:
-            if not email_to:
-                results.append({"name": name, "status": "skipped", "reason": "No email address found"})
-                continue
-            msg["To"]  = f"{name} <{email_to}>"
-            actual_to  = email_to
-
-        if cc_email:
-            msg["Cc"] = cc_email
-
-        msg.attach(MIMEText(body, "plain", "utf-8"))
-
-        # ── Optional attachment ──────────────────────────────────────
-        if attachment_b64 and attachment_name:
-            try:
-                att_bytes = base64.b64decode(attachment_b64)
-                part = MIMEBase("application", "octet-stream")
-                part.set_payload(att_bytes)
-                encoders.encode_base64(part)
-                part.add_header("Content-Disposition",
-                                f'attachment; filename="{attachment_name}"')
-                msg.attach(part)
-            except Exception:
-                pass
-
-        # ── Send via Gmail API ────────────────────────────────────────
-        try:
-            raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
-            send_resp = requests.post(
-                "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
-                headers=gmail_headers,
-                json={"raw": raw},
-                timeout=30,
-            )
-            if send_resp.status_code == 401:
-                return jsonify({"error": "Google sign-in expired — sign in again and resend", "results": results}), 401
-            if send_resp.status_code >= 400:
-                err = send_resp.json().get("error", {}).get("message", f"HTTP {send_resp.status_code}")
-                results.append({"name": name, "status": "error", "reason": err})
-            else:
-                results.append({
-                    "name":    name,
-                    "company": company,
-                    "sent_to": actual_to,
-                    "subject": msg["Subject"],
-                    "status":  "sent",
-                })
-        except Exception as exc:
-            results.append({"name": name, "status": "error", "reason": str(exc)})
-
-        time.sleep(0.5)
-
-    sent_count = sum(1 for r in results if r["status"] == "sent")
-    return jsonify({
-        "total":     len(results),
-        "sent":      sent_count,
-        "failed":    len(results) - sent_count,
-        "test_mode": test_mode,
-        "results":   results,
-    })
 
 
 if __name__ == "__main__":

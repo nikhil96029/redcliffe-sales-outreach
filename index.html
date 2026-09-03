@@ -7,7 +7,6 @@
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <script src="https://accounts.google.com/gsi/client" async defer></script>
   <style>
     /* ── Variables ───────────────────────────────────────────── */
     :root {
@@ -523,12 +522,7 @@ const PITCH_ANGLES = [
 
 const AVATAR_COLORS = ["#6366f1","#0ea5e9","#10b981","#f59e0b","#ec4899"];
 
-// Replace with your own OAuth Client ID from Google Cloud Console (OAuth consent screen
-// must include the gmail.send scope, and this page's origin must be an authorized JS origin).
-const GOOGLE_CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com";
-const GOOGLE_CONFIGURED = !GOOGLE_CLIENT_ID.startsWith("YOUR_GOOGLE_CLIENT_ID");
-
-const STEPS = ["Scan Events","People","Insights","Email"];
+const STEPS = ["Scan Events","People · Insight · Email"];
 
 /* ── OpenAI key (per-browser, never sent to anyone but our own server) ── */
 const OPENAI_KEY_STORAGE = "redcliffe_openai_key";
@@ -856,13 +850,25 @@ function Step1({ onNext }) {
   );
 }
 
-/* ── Step 2 — People Extractor ─────────────────────────────── */
-function Step2({ event, onNext, onBack }) {
+/* ── Step 2 — People + per-speaker Insight + composed Email ─── */
+function Step2({ event, onBack }) {
   const [people,      setPeople]      = React.useState([]);
   const [sourceLinks, setSourceLinks] = React.useState([]);
   const [loading,     setLoading]     = React.useState(false);
   const [error,       setError]       = React.useState("");
   const [retry,       setRetry]       = React.useState(0);
+
+  // selection + inline insight/email generation
+  const [selectedIds, setSelectedIds] = React.useState(() => new Set());
+  const [senderName,  setSenderName]  = React.useState("");
+  const [senderRole,  setSenderRole]  = React.useState("");
+  const [pitchAngle,  setPitchAngle]  = React.useState(PITCH_ANGLES[0]);
+  const [genLoading,  setGenLoading]  = React.useState(false);
+  const [genError,    setGenError]    = React.useState("");
+  const [genStage,    setGenStage]    = React.useState("");
+  const [results,     setResults]     = React.useState({});   // id -> { ins, subject, body, editedBody }
+  const [copied,      setCopied]      = React.useState("");
+
   React.useEffect(() => {
     let cancelled = false;
     async function extract() {
@@ -893,11 +899,85 @@ function Step2({ event, onNext, onBack }) {
     return () => { cancelled = true; };
   }, [retry]);
 
+  function toggle(id) {
+    setSelectedIds(s => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  }
+  const selectedPeople = people.filter(p => selectedIds.has(p.id));
+  const canGenerate = selectedPeople.length > 0 && senderName.trim() && senderRole.trim() && !genLoading;
+
+  async function generateForSelected() {
+    setGenLoading(true); setGenError(""); setGenStage("Researching what each selected speaker said…");
+    try {
+      const key = getOpenAIKey();
+      // 1 — insight, only for the selected speakers
+      const insRes = await fetch("/api/search-insights", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ event_name: event.name, event_city: event.city, people: selectedPeople, openai_key: key }),
+      });
+      const insData = await insRes.json();
+      if (!insRes.ok) throw new Error(insData.error || `HTTP ${insRes.status}`);
+      const insArr = parseJSON(insData.choices[0].message.content);
+      const insMap = Object.fromEntries(insArr.map(x => [x.id, x]));
+
+      // 2 — compose an email off each of those insights
+      setGenStage("Composing a personalised email for each…");
+      const enriched = selectedPeople.map(p => ({ ...p, email_hint: p.email_hint || "" }));
+      const pvRes = await fetch("/api/preview-bulk", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          event, people: enriched, insights: insArr,
+          sender_name: senderName.trim(), sender_role: senderRole.trim(),
+          pitch_angle: pitchAngle, openai_key: key,
+        }),
+      });
+      const pvData = await pvRes.json();
+      if (!pvRes.ok) throw new Error(pvData.error || `HTTP ${pvRes.status}`);
+      const pv = pvData.previews || {};
+
+      setResults(prev => {
+        const next = { ...prev };
+        selectedPeople.forEach(p => {
+          const b = (pv[p.id] && pv[p.id].body) || "";
+          next[p.id] = {
+            ins:     insMap[p.id] || null,
+            subject: (pv[p.id] && pv[p.id].subject) || ("Partnership — " + event.name),
+            body:    b,
+            editedBody: b,
+          };
+        });
+        return next;
+      });
+    } catch(e) { setGenError(e.message); }
+    finally   { setGenLoading(false); setGenStage(""); }
+  }
+
+  function setBody(id, val) { setResults(r => ({ ...r, [id]: { ...r[id], editedBody: val } })); }
+  function emailText(p) {
+    const r = results[p.id] || {};
+    return [
+      "To: " + (p.email_hint || "(no email)"),
+      "Subject: " + (r.subject || ""),
+      "",
+      (r.editedBody || r.body || "").trim(),
+    ].join("\n");
+  }
+  async function copyText(text, tag) {
+    try { await navigator.clipboard.writeText(text); }
+    catch {
+      const ta = document.createElement("textarea"); ta.value = text;
+      document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); } catch {}
+      document.body.removeChild(ta);
+    }
+    setCopied(tag); setTimeout(() => setCopied(c => (c === tag ? "" : c)), 1600);
+  }
+  const donePeople = people.filter(p => results[p.id]);
+
   return (
     <div className="panel">
-      <div className="panel-title">People Extractor</div>
+      <div className="panel-title">People · Insight · Email</div>
       <div className="panel-sub">
-        Searching real speaker listings, event pages & news for <strong>{event.name}</strong>.
+        Real speakers for <strong>{event.name}</strong>. Tick the ones you want, then generate an insight and a ready-to-copy email for just those.
       </div>
       <div className="info-note">
         🌐 Searching real speaker listings, event pages, and news sources — takes ~20 seconds.
@@ -913,34 +993,44 @@ function Step2({ event, onNext, onBack }) {
 
       {people.length > 0 && (
         <>
-          <div className="section-title">🟢 {people.length} Real Speakers Found</div>
+          <div className="section-title">🟢 {people.length} Real Speakers Found · {selectedPeople.length} selected</div>
           <div className="people-grid">
-            {people.map((p,i) => (
-              <div key={p.id} className="person-card">
-                <div className="avatar"
-                  style={{background: AVATAR_COLORS[i % AVATAR_COLORS.length]}}>
-                  {getInitials(p.name)}
-                </div>
-                <div style={{flex:1, minWidth:0}}>
-                  <div className="person-name">{p.name}</div>
-                  <div className="person-title">{p.title}</div>
-                  <div className="person-company">{p.company}</div>
-                  <span className="person-topic-tag">{p.topic}</span>
-                  {p.speaking_about && (
-                    <div style={{fontSize:11,color:"var(--text-2)",marginTop:5,fontStyle:"italic",lineHeight:1.4}}>
-                      🎤 {p.speaking_about}
+            {people.map((p,i) => {
+              const sel  = selectedIds.has(p.id);
+              const done = !!results[p.id];
+              return (
+                <div key={p.id} className="person-card" onClick={() => toggle(p.id)}
+                  style={{cursor:"pointer", outline: sel ? "2px solid var(--primary)" : "none", outlineOffset:2}}>
+                  <input type="checkbox" checked={sel} readOnly
+                    style={{marginTop:4, cursor:"pointer", flexShrink:0}} />
+                  <div className="avatar"
+                    style={{background: AVATAR_COLORS[i % AVATAR_COLORS.length]}}>
+                    {getInitials(p.name)}
+                  </div>
+                  <div style={{flex:1, minWidth:0}}>
+                    <div className="person-name">
+                      {p.name}
+                      {done && <span style={{marginLeft:6,fontSize:11,color:"var(--primary)",fontWeight:600}}>✓ generated</span>}
                     </div>
-                  )}
-                  <div className="person-email">{p.email_hint}</div>
-                  {p.source_url && (
-                    <a href={p.source_url} target="_blank" rel="noopener noreferrer"
-                      className="ref-link" style={{marginTop:6}}>
-                      📄 View Source
-                    </a>
-                  )}
+                    <div className="person-title">{p.title}</div>
+                    <div className="person-company">{p.company}</div>
+                    <span className="person-topic-tag">{p.topic}</span>
+                    {p.speaking_about && (
+                      <div style={{fontSize:11,color:"var(--text-2)",marginTop:5,fontStyle:"italic",lineHeight:1.4}}>
+                        🎤 {p.speaking_about}
+                      </div>
+                    )}
+                    <div className="person-email">{p.email_hint}</div>
+                    {p.source_url && (
+                      <a href={p.source_url} target="_blank" rel="noopener noreferrer"
+                        className="ref-link" style={{marginTop:6}} onClick={e => e.stopPropagation()}>
+                        📄 View Source
+                      </a>
+                    )}
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
           {/* ── Source Links ── */}
           {sourceLinks.length > 0 && (
@@ -957,15 +1047,125 @@ function Step2({ event, onNext, onBack }) {
             </div>
           )}
 
+          {/* ── Generate insight + email for the selected speakers ── */}
+          <div style={{border:"1.5px solid var(--border)",borderRadius:"var(--radius-sm)",padding:14,marginTop:16}}>
+            <div className="section-title" style={{marginTop:0}}>✨ Generate for {selectedPeople.length} selected</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
+              <div>
+                <label className="field-label">Your Name</label>
+                <input className="text-input" placeholder="e.g. Nikhil Sharma"
+                  value={senderName} onChange={e => setSenderName(e.target.value)} />
+              </div>
+              <div>
+                <label className="field-label">Your Role</label>
+                <input className="text-input" placeholder="e.g. Corporate Partnerships Lead"
+                  value={senderRole} onChange={e => setSenderRole(e.target.value)} />
+              </div>
+            </div>
+            <label className="field-label">Pitch Angle</label>
+            <div className="pills-wrap" style={{marginBottom:12}}>
+              {PITCH_ANGLES.map(a => (
+                <button key={a} className={`pill ${pitchAngle===a?"selected":""}`}
+                  onClick={() => setPitchAngle(a)}>{a}</button>
+              ))}
+            </div>
+            {genError && <div className="error-alert">⚠ {genError}</div>}
+            {genLoading
+              ? <Spinner label={genStage || "Working…"} />
+              : <button className="btn btn-primary" disabled={!canGenerate} onClick={generateForSelected}>
+                  ✨ Generate Insight &amp; Email ({selectedPeople.length})
+                </button>}
+            {!canGenerate && !genLoading && selectedPeople.length > 0 && (
+              <div style={{fontSize:11,color:"var(--text-3)",marginTop:6}}>Enter your name and role to enable.</div>
+            )}
+            {selectedPeople.length === 0 && !genLoading && (
+              <div style={{fontSize:11,color:"var(--text-3)"}}>Tick one or more speaker cards above.</div>
+            )}
+          </div>
+
+          {/* ── Results: insight + composed email per selected speaker ── */}
+          {donePeople.length > 0 && (
+            <div style={{marginTop:18}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,flexWrap:"wrap",marginBottom:10}}>
+                <div className="section-title" style={{marginTop:0,marginBottom:0}}>📨 {donePeople.length} ready</div>
+                <button className="btn btn-outline btn-sm"
+                  onClick={() => copyText(donePeople.map(p => "━━━ " + p.name + " · " + p.company + " ━━━\n" + emailText(p)).join("\n\n\n"), "all")}>
+                  {copied === "all" ? "✓ Copied all" : "📋 Copy all (" + donePeople.length + ")"}
+                </button>
+              </div>
+              {donePeople.map((p,i) => {
+                const r = results[p.id]; const ins = r.ins || {};
+                return (
+                  <div key={p.id} style={{border:"1.5px solid var(--border)",borderRadius:"var(--radius-sm)",padding:14,marginBottom:10}}>
+                    <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+                      <div className="avatar" style={{background:AVATAR_COLORS[i%AVATAR_COLORS.length],width:32,height:32,fontSize:12,borderRadius:8}}>
+                        {getInitials(p.name)}
+                      </div>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div className="person-name">{p.name}</div>
+                        <div className="person-title">{p.title} · {p.company}</div>
+                      </div>
+                    </div>
+
+                    {ins.speaking_topic && (
+                      <>
+                        <div className="opportunity-label" style={{color:"#0ea5e9"}}>🎤 Their session</div>
+                        <div style={{fontSize:13,fontWeight:600,background:"rgba(14,165,233,.08)",
+                          border:"1px solid rgba(14,165,233,.25)",borderRadius:6,padding:"7px 12px",marginBottom:10}}>
+                          {ins.speaking_topic}
+                        </div>
+                      </>
+                    )}
+                    {ins.what_they_said && (
+                      <>
+                        <div className="opportunity-label" style={{color:"#6366f1"}}>💬 What they said / their position</div>
+                        <div className="hook-box" style={{marginBottom:10,borderLeftColor:"#6366f1"}}>"{ins.what_they_said}"</div>
+                      </>
+                    )}
+                    {Array.isArray(ins.pain_points) && ins.pain_points.length > 0 && (
+                      <div className="pain-points">
+                        {ins.pain_points.map((pp,j) => <span key={j} className="pain-badge">⚡ {pp}</span>)}
+                      </div>
+                    )}
+                    {ins.hook && (
+                      <>
+                        <div className="opportunity-label" style={{marginTop:10}}>✉️ Email opener</div>
+                        <div className="hook-box">"{ins.hook}"</div>
+                      </>
+                    )}
+                    {ins.opportunity && (
+                      <>
+                        <div className="opportunity-label">💼 How Redcliffe Labs can help</div>
+                        <div className="opportunity-text">{ins.opportunity}</div>
+                      </>
+                    )}
+
+                    <div className="opportunity-label" style={{marginTop:12}}>
+                      📧 Composed email <span style={{fontWeight:400,textTransform:"none"}}>— To: {p.email_hint || "no email"}</span>
+                    </div>
+                    <div style={{fontSize:13,fontWeight:600,margin:"4px 0 6px"}}>{r.subject}</div>
+                    <textarea value={r.editedBody}
+                      onChange={e => setBody(p.id, e.target.value)}
+                      style={{width:"100%",minHeight:150,padding:"10px 12px",border:"1.5px solid var(--border)",
+                        borderRadius:6,background:"var(--surface)",color:"var(--text)",fontSize:13,
+                        fontFamily:"inherit",lineHeight:1.65,resize:"vertical",outline:"none"}} />
+                    <div style={{marginTop:8}}>
+                      <button className="btn btn-outline btn-sm" onClick={() => copyText(emailText(p), p.id)}>
+                        {copied === p.id ? "✓ Copied" : "📋 Copy this email"}
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
           <div className="btn-row">
             <button className="btn btn-ghost btn-sm" onClick={onBack}>← Back</button>
             <button className="btn btn-outline btn-sm"
               onClick={() => downloadCSV(people, event.name)}
-              title="Download speakers list as CSV for bulk email outreach">
+              title="Download speakers list as CSV">
               📥 Download CSV
-            </button>
-            <button className="btn btn-primary" onClick={() => onNext(people)}>
-              Generate Insights →
             </button>
           </div>
         </>
@@ -1136,53 +1336,6 @@ function Step3({ event, people, onNext, onBack }) {
   );
 }
 
-/* ── Google Sign-In (Gmail send scope, client-side token flow) ── */
-const GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/userinfo.email";
-
-function useGoogleAuth() {
-  const [token,     setToken]     = React.useState(null);
-  const [email,     setEmail]     = React.useState("");
-  const [signing,   setSigning]   = React.useState(false);
-  const [authError, setAuthError] = React.useState("");
-  const clientRef = React.useRef(null);
-
-  React.useEffect(() => {
-    if (!GOOGLE_CONFIGURED) return;
-    let cancelled = false;
-    function init() {
-      if (cancelled) return;
-      if (!window.google?.accounts?.oauth2) { setTimeout(init, 300); return; }
-      clientRef.current = window.google.accounts.oauth2.initTokenClient({
-        client_id: GOOGLE_CLIENT_ID,
-        scope: GMAIL_SEND_SCOPE,
-        callback: async (resp) => {
-          if (resp.error) { setAuthError(resp.error); setSigning(false); return; }
-          setToken(resp.access_token);
-          try {
-            const r = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
-              headers: { Authorization: `Bearer ${resp.access_token}` },
-            });
-            const info = await r.json();
-            setEmail(info.email || "");
-          } catch {}
-          setSigning(false);
-        },
-      });
-    }
-    init();
-    return () => { cancelled = true; };
-  }, []);
-
-  function signIn() {
-    setAuthError(""); setSigning(true);
-    if (!clientRef.current) { setAuthError("Google sign-in is still loading — try again in a moment"); setSigning(false); return; }
-    clientRef.current.requestAccessToken({ prompt: "consent" });
-  }
-  function signOut() { setToken(null); setEmail(""); }
-
-  return { token, email, signing, authError, signIn, signOut };
-}
-
 const APOLLO_STATUS_CFG = {
   verified:          { label:"✅ Verified",    color:"#10b981" },
   likely_to_engage:  { label:"✓ Likely",       color:"#10b981" },
@@ -1191,16 +1344,12 @@ const APOLLO_STATUS_CFG = {
   error:             { label:"⚠ Error",        color:"#b91c1c" },
 };
 
-/* ── Step 4 — Bulk Email Composer (Gmail API) ─────────────────── */
+/* ── Step 4 — Bulk Email Composer (compose & copy only) ────── */
 function Step4({ event, people, insights, onBack }) {
-  const google = useGoogleAuth();
-
   const [senderName,  setSenderName]  = React.useState("");
   const [senderRole,  setSenderRole]  = React.useState("");
   const [ccEmail,     setCcEmail]     = React.useState("");
   const [pitchAngle,  setPitchAngle]  = React.useState(PITCH_ANGLES[0]);
-  const [testMode,    setTestMode]    = React.useState(true);
-  const [attachFile,  setAttachFile]  = React.useState(null);
   const [apolloKey,   setApolloKey]   = React.useState("");
   const [lookupBusy,  setLookupBusy]  = React.useState(false);
 
@@ -1208,12 +1357,12 @@ function Step4({ event, people, insights, onBack }) {
     Object.fromEntries(people.map(p => [p.id, { email: p.email_hint || "", included: true, apolloStatus: null }]))
   );
 
-  const [bulkStep, setBulkStep] = React.useState("config"); // "config" | "preview" | "done"
+  const [bulkStep, setBulkStep] = React.useState("config"); // "config" | "preview"
   const [previews, setPreviews] = React.useState({});
   const [expanded, setExpanded] = React.useState({});
   const [loading,  setLoading]  = React.useState(false);
   const [error,    setError]    = React.useState("");
-  const [results,  setResults]  = React.useState(null);
+  const [copied,   setCopied]   = React.useState("");   // person id (or "all") just copied
 
   function setRecipEmail(id, val) {
     setRecipientMap(m => ({ ...m, [id]: { ...m[id], email: val, apolloStatus: null } }));
@@ -1231,15 +1380,6 @@ function Step4({ event, people, insights, onBack }) {
   const includedPeople = people.filter(p => recipientMap[p.id]?.included);
   const allChecked     = includedPeople.length === people.length;
   const missingEmail   = includedPeople.filter(p => !(recipientMap[p.id]?.email||"").trim()).length;
-
-  async function readFileAsB64(file) {
-    return new Promise((res, rej) => {
-      const r = new FileReader();
-      r.onload  = () => res(r.result.split(",")[1]);
-      r.onerror = rej;
-      r.readAsDataURL(file);
-    });
-  }
 
   async function findViaApollo() {
     if (!apolloKey.trim()) { setError("Enter your Apollo API key first"); return; }
@@ -1292,93 +1432,52 @@ function Step4({ event, people, insights, onBack }) {
     finally    { setLoading(false); }
   }
 
-  async function sendAll() {
-    setLoading(true); setError("");
+  function emailAsText(p) {
+    const pv    = previews[p.id] || {};
+    const email = (recipientMap[p.id]?.email || "").trim();
+    const cc    = ccEmail.trim();
+    return [
+      `To: ${email || "(no email)"}`,
+      cc ? `Cc: ${cc}` : null,
+      `Subject: ${pv.subject || ""}`,
+      "",
+      (pv.editedBody || pv.body || "").trim(),
+    ].filter(l => l !== null).join("\n");
+  }
+
+  async function copyText(text, tag) {
     try {
-      if (!google.token) throw new Error("Sign in with Google first");
-      let attachment_b64 = "", attachment_name = "";
-      if (attachFile) {
-        attachment_b64  = await readFileAsB64(attachFile);
-        attachment_name = attachFile.name;
-      }
-      const enriched = includedPeople.map(p => ({ ...p, email_hint: (recipientMap[p.id]?.email || "").trim() }));
-      const previewsToSend = Object.fromEntries(
-        Object.entries(previews).map(([id, pv]) => [id, { subject: pv.subject, body: pv.editedBody || pv.body }])
-      );
-      const res = await fetch("/api/send-bulk", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          access_token: google.token, sender_email: google.email,
-          sender_name:  senderName.trim() || "Redcliffe Labs",
-          sender_role:  senderRole.trim() || "Corporate Partnerships",
-          cc_email:     ccEmail.trim(),
-          test_mode:    testMode, pitch_angle: pitchAngle,
-          event, people: enriched,
-          insights:     insights.filter(ins => enriched.some(p => p.id === ins.id)),
-          previews:     previewsToSend,
-          attachment_b64, attachment_name,
-          openai_key:   getOpenAIKey(),
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        if (res.status === 401) google.signOut();
-        throw new Error(data.error || `HTTP ${res.status}`);
-      }
-      setResults(data);
-      setBulkStep("done");
-    } catch(e) { setError(e.message); }
-    finally    { setLoading(false); }
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); } catch {}
+      document.body.removeChild(ta);
+    }
+    setCopied(tag);
+    setTimeout(() => setCopied(c => (c === tag ? "" : c)), 1600);
+  }
+
+  function copyOne(p)  { copyText(emailAsText(p), p.id); }
+  function copyAll()   {
+    const blocks = includedPeople.map(p => `━━━ ${p.name} · ${p.company} ━━━\n${emailAsText(p)}`);
+    copyText(blocks.join("\n\n\n"), "all");
   }
 
   const canPreview = senderName.trim() && senderRole.trim() && includedPeople.length > 0;
-  const canSend    = canPreview && !!google.token;
-
-  if (!GOOGLE_CONFIGURED) {
-    return (
-      <div className="panel">
-        <div className="panel-title">Email Composer</div>
-        <div className="error-alert" style={{marginTop:12}}>
-          ⚠ Google sign-in isn't configured yet. Set <code>GOOGLE_CLIENT_ID</code> near the top of this file
-          to a real OAuth Client ID from Google Cloud Console (with the Gmail API enabled and this page's
-          origin added as an authorized JavaScript origin) to enable sending.
-        </div>
-        <div className="btn-row"><button className="btn btn-ghost btn-sm" onClick={onBack}>← Back</button></div>
-      </div>
-    );
-  }
 
   return (
     <div className="panel">
       <div className="panel-title">Email Composer</div>
       <div className="panel-sub">
-        Personalised pitch emails referencing <strong>{event.name}</strong>, sent from your own Gmail via Google sign-in.
+        Personalised pitch emails referencing <strong>{event.name}</strong> — draft, review, and copy. Nothing is sent from here.
       </div>
 
       {/* ════════════════ STEP: config ════════════════ */}
       {bulkStep === "config" && (
         <>
           <div className="info-note" style={{marginBottom:18}}>
-            📨 <strong>Step 1 of 3:</strong> Sign in with Google, configure your message, then preview before sending.
-          </div>
-
-          {/* Google sign-in */}
-          <div className="field-wrap">
-            <label className="field-label">Send As</label>
-            {google.token ? (
-              <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
-                <span style={{fontSize:13,fontWeight:600,color:"var(--success)"}}>✓ Signed in as {google.email || "…"}</span>
-                <button className="btn btn-ghost btn-sm" onClick={google.signOut}>Sign out</button>
-              </div>
-            ) : (
-              <div>
-                <button className="btn btn-outline btn-sm" onClick={google.signIn} disabled={google.signing}>
-                  {google.signing ? "Opening Google sign-in…" : "🔐 Sign in with Google"}
-                </button>
-                {google.authError && <div style={{fontSize:12,color:"#b91c1c",marginTop:6}}>⚠ {google.authError}</div>}
-              </div>
-            )}
+            📨 <strong>Step 1 of 2:</strong> Configure your message, then generate previews to review and copy.
           </div>
 
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
@@ -1407,39 +1506,6 @@ function Step4({ event, people, insights, onBack }) {
                   onClick={() => setPitchAngle(a)}>{a}</button>
               ))}
             </div>
-          </div>
-
-          <div className="field-wrap">
-            <label className="field-label">Attachment (optional)</label>
-            <label className="attach-label">
-              📎 {attachFile ? attachFile.name : "Click to add PDF brochure / deck"}
-              <input type="file" style={{display:"none"}} accept=".pdf,.pptx,.docx,.jpg,.png"
-                onChange={e => setAttachFile(e.target.files[0]||null)} />
-            </label>
-            {attachFile && (
-              <div className="attach-chosen">
-                ✓ {attachFile.name} ({(attachFile.size/1024).toFixed(0)} KB)
-                <button onClick={() => setAttachFile(null)}
-                  style={{marginLeft:8,border:"none",background:"none",color:"#b91c1c",cursor:"pointer",fontSize:12}}>✕</button>
-              </div>
-            )}
-          </div>
-
-          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:18,
-                       padding:"11px 14px",background:"var(--surface-2)",
-                       border:"1px solid var(--border)",borderRadius:"var(--radius-sm)"}}>
-            <input type="checkbox" id="tm2" checked={testMode}
-              onChange={e => setTestMode(e.target.checked)} style={{width:16,height:16,cursor:"pointer"}} />
-            <label htmlFor="tm2" style={{cursor:"pointer",flex:1}}>
-              <span style={{fontWeight:600,fontSize:13}}>
-                Test Mode {testMode && <span className="test-badge">🧪 ON</span>}
-              </span>
-              <div style={{fontSize:12,color:"var(--text-2)",marginTop:1}}>
-                {testMode
-                  ? `All emails → YOUR inbox (${google.email||"your Gmail"}) so you can review before real send.`
-                  : "⚠ Real Mode — emails go to the actual speaker addresses."}
-              </div>
-            </label>
           </div>
 
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6,flexWrap:"wrap",gap:8}}>
@@ -1551,9 +1617,13 @@ function Step4({ event, people, insights, onBack }) {
       {/* ════════════════ STEP: preview ════════════════ */}
       {bulkStep === "preview" && (
         <>
-          <div className="info-note" style={{marginBottom:16}}>
-            👁 <strong>Step 2 of 3:</strong> Review every email below. Click to expand, edit the body if needed, then send.
-            {testMode && <span className="test-badge" style={{marginLeft:8}}>🧪 Test Mode ON</span>}
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,marginBottom:16,flexWrap:"wrap"}}>
+            <div className="info-note" style={{margin:0,flex:1,minWidth:220}}>
+              👁 <strong>Step 2 of 2:</strong> Review every email below. Click to expand and edit the body, then copy.
+            </div>
+            <button className="btn btn-primary btn-sm" onClick={copyAll} style={{whiteSpace:"nowrap"}}>
+              {copied === "all" ? "✓ Copied all" : `📋 Copy all (${includedPeople.length})`}
+            </button>
           </div>
 
           {includedPeople.map((p,i) => {
@@ -1581,6 +1651,10 @@ function Step4({ event, people, insights, onBack }) {
                       {pv.subject||"—"}
                     </div>
                   </div>
+                  <button className="btn btn-outline btn-sm" style={{padding:"3px 9px",fontSize:11,whiteSpace:"nowrap",flexShrink:0}}
+                    onClick={e => { e.stopPropagation(); copyOne(p); }}>
+                    {copied === p.id ? "✓ Copied" : "📋 Copy"}
+                  </button>
                   <span style={{fontSize:18,color:"var(--text-3)",flexShrink:0}}>{open?"▲":"▼"}</span>
                 </div>
 
@@ -1611,59 +1685,12 @@ function Step4({ event, people, insights, onBack }) {
           })}
 
           {error && <div className="error-alert" style={{marginTop:12}}>⚠ {error}</div>}
-          {loading && <Spinner label={`Sending ${includedPeople.length} emails…`} />}
 
-          {!loading && (
-            <div className="btn-row">
-              <button className="btn btn-ghost btn-sm" onClick={() => setBulkStep("config")}>← Edit Recipients</button>
-              <button className="btn btn-primary" disabled={!canSend} onClick={sendAll}>
-                {testMode
-                  ? `🧪 Send Test (${includedPeople.length} → my inbox)`
-                  : `📨 Send for Real (${includedPeople.length} emails)`}
-              </button>
-            </div>
-          )}
-        </>
-      )}
-
-      {/* ════════════════ STEP: done ════════════════ */}
-      {bulkStep === "done" && results && (
-        <>
-          <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:12}}>
-            <span style={{fontWeight:700,fontSize:15}}>
-              ✅ {results.sent}/{results.total} sent
-              {results.test_mode && <span className="test-badge" style={{marginLeft:8}}>🧪 Test Mode</span>}
-            </span>
-            {results.failed > 0 && <span style={{fontSize:13,color:"#b91c1c"}}>{results.failed} failed</span>}
-          </div>
-          <table className="bulk-table">
-            <thead><tr><th>Name</th><th>Sent To</th><th>Subject</th><th>Status</th></tr></thead>
-            <tbody>
-              {results.results.map((r,i) => (
-                <tr key={i}>
-                  <td style={{fontWeight:600}}>{r.name}</td>
-                  <td style={{fontSize:11,color:"var(--text-3)",fontFamily:"monospace"}}>{r.sent_to||"—"}</td>
-                  <td style={{fontSize:12,color:"var(--text-2)",maxWidth:200,overflow:"hidden",
-                              textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.subject||"—"}</td>
-                  <td>
-                    <span className={`status-dot ${r.status}`}>
-                      {r.status==="sent"?"✅ Sent":r.status==="skipped"?"⏭ Skipped":r.status==="error"?"❌ Error":r.status}
-                    </span>
-                    {r.reason && <div style={{fontSize:11,color:"var(--text-3)",marginTop:2}}>{r.reason}</div>}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
           <div className="btn-row">
-            <button className="btn btn-ghost btn-sm" onClick={() => { setBulkStep("config"); setResults(null); }}>
-              ↺ Start Over
+            <button className="btn btn-ghost btn-sm" onClick={() => setBulkStep("config")}>← Edit Recipients</button>
+            <button className="btn btn-primary" onClick={copyAll}>
+              {copied === "all" ? "✓ Copied all emails" : `📋 Copy all emails (${includedPeople.length})`}
             </button>
-            {results.test_mode && (
-              <button className="btn btn-primary" onClick={() => { setTestMode(false); setBulkStep("preview"); }}>
-                📨 Send for Real →
-              </button>
-            )}
           </div>
         </>
       )}
@@ -1703,10 +1730,8 @@ function OpenAIKeyField() {
 
 /* ── App ───────────────────────────────────────────────────── */
 function App() {
-  const [step,     setStep]     = React.useState(0);
-  const [event,    setEvent]    = React.useState(null);
-  const [people,   setPeople]   = React.useState([]);
-  const [insights, setInsights] = React.useState([]);
+  const [step,  setStep]  = React.useState(0);
+  const [event, setEvent] = React.useState(null);
 
   return (
     <div>
@@ -1728,24 +1753,7 @@ function App() {
         {step === 1 && event && (
           <Step2
             event={event}
-            onNext={pp => { setPeople(pp); setStep(2); }}
             onBack={() => setStep(0)}
-          />
-        )}
-        {step === 2 && event && people.length > 0 && (
-          <Step3
-            event={event}
-            people={people}
-            onNext={ins => { setInsights(ins); setStep(3); }}
-            onBack={() => setStep(1)}
-          />
-        )}
-        {step === 3 && event && people.length > 0 && insights.length > 0 && (
-          <Step4
-            event={event}
-            people={people}
-            insights={insights}
-            onBack={() => setStep(2)}
           />
         )}
       </main>
